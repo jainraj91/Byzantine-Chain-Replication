@@ -1,0 +1,275 @@
+import pickle
+import nacl.encoding
+import nacl.signing
+import nacl.hash
+from datetime import datetime
+
+class Client(process):
+    def setup(olympus, index, workload, timeout):
+        import re
+        self.config = None
+        output("[Client",index,":] Workload: ", workload)
+
+        self.commands = None
+        self.timeout_reply = 0
+        self.error_in_replica = 0
+        self.command_state = {}
+        self.replica_public_keys = []
+        self.result_sequence = []
+        self.database = {}
+        self.wait_for_result = 1
+        self.poll_time = 5
+        self.poll_started = False
+        self.system_state = None
+
+        if not 'random' in workload:
+            self.commands = workload.split(';')
+        else:
+            matches = workload[workload.index("(") + 1:workload.index(")")].split(',')
+            seq_seed = int(matches[0])
+            seq_len = int(matches[1])
+            generatePseudoRandomWorkLoad(seq_seed, seq_len)
+        if not self.commands is None:
+            for i in range(len(self.commands)):
+                self.command_state[i] = [self.commands[i], 100]       ## State 100 -> not started
+
+    def generatePseudoRandomWorkLoad(seq_seed, seq_len):
+        import random
+        keys = ['hello','ice','moon','country']
+        value = ['world','hockey','walk','India']
+        commands = list()
+        seq = list(range(seq_len))
+        random.seed(seq_seed)
+        random_seq = random.sample(seq, seq_len)
+        for val in random_seq:
+            randkey = random.randint(0,3)
+            randval = random.randint(0,3)
+            if val%4 == 0:
+                data = 'put(\''+keys[randkey]+'\',\''+value[randval]+'\')'
+                commands.append(data)
+            elif val%4 == 1:
+                data = 'append(\''+keys[randkey]+'\',\''+value[randval]+'\')'
+                commands.append(data)
+            elif val%4 == 2:
+                data = 'get(\''+keys[randkey]+'\')'
+                commands.append(data)
+            elif val%4 == 3:
+                data = 'slice(\''+keys[randkey]+'\',\'0:4\')'
+                commands.append(data)
+        output(commands)
+
+    def run():
+        send(('req_register_for_state_change', self), to=olympus)
+        start_time = datetime.now()
+        output("[Client",index,":] Started: ",start_time.second)
+        if self.config is None:
+            send(('req_get_current_configuration', self), to=olympus)
+            await(self.config is not None)
+
+        if not self.commands is None:
+            for i in range(len(self.commands)):
+                while self.config == None:
+                    end_time = datetime.now()
+                    if(end_time.second - start_time.second >= self.poll_time):
+                        output("[Client",index,":] Periodically checking olympus if there is any new configuration")
+                        output("[Client",index,":]>> req_get_current_configuration")
+                        send(('req_get_current_configuration', self), to=olympus)
+                        if await(self.config != None):pass
+                        elif timeout(1):pass
+                        start_time = datetime.now()
+                sendOperation(i)
+            resultValidation()
+        -- l
+        await(some(received(('terminate_client'))))
+
+    def receive (msg= ('res_get_current_configuration', config, replica_public_keys)):
+        output("[Client",index,":]<< res_get_current_configuration")
+        self.config = config
+        self.poll_started = False
+        self.replica_public_keys = replica_public_keys
+
+    def receive (msg= ('res_current_state', state)):
+        output("[Client",index,":]<< res_current_state")
+        self.system_state = state
+
+    def sendOperation(key):
+        command_and_state = self.command_state[key]
+        operation = makeOperation(key, command_and_state[0])
+        command_and_state[1] = 101          ## State 101 -> in progress
+
+        ##### Sending operation to HeadNode ###
+        output("[Client",index,":]>> req_operation: ", operation.toString())
+        send(('req_current_state', self, self.index), to=olympus)
+        await(self.system_state == 'RUNNING')
+        send(('req_operation', operation, self, self.index), to=self.config.list_replica[0])
+        self.command_state[key] = [command_and_state[0], command_and_state[1]]
+        self.wait_for_result = 1
+        if(await(self.wait_for_result < 1)): pass
+        elif timeout(timeout):
+            if self.poll_started is False:
+                self.timeout_reply = 0
+                self.error_in_replica = 0
+                output("[Client",index,":] Client Timeout.")
+                for key in self.command_state.keys():
+                    val = self.command_state[key]
+                    if val[1] == 101:
+                        resend_operation = makeOperation(key, val[0])
+                        i = 0;
+                        for replica in self.config.list_replica:
+                            output("[Client",index,":]>> req_operation_timeout: Replica: ",i, operation.toString())
+                            send(('req_operation_timeout', resend_operation, "client", self, self.index), to=replica)
+                            i += 1
+                        if await(self.timeout_reply > len(self.config.list_replica)/2 or self.error_in_replica > 0): pass
+                        elif timeout(timeout):
+                            output("[Client",index,":] Not received from Quoram, Terminate System.")
+
+    def makeOperation(seq_id, command):
+        command = command.strip()
+        class_operation = import_da('Operation')
+        operation = class_operation.Operation()
+        operation.client_seq_id = seq_id+1
+        operation.client_request_id = index         #sending its index to identify client
+        if 'put' in command:
+            operation.type = 1
+            operation.command = command[3:]
+        elif 'get' in command:
+            operation.type = 2
+            operation.command = command[3:]
+        elif 'slice' in command:
+            operation.type = 3
+            operation.command = command[5:]
+        elif 'append' in command:
+            operation.type = 4
+            operation.command = command[6:]
+        return operation
+
+    def receive (msg= ('res_operation', operation, result, result_proof)):
+
+        discard_flag = False
+
+        ## calculate the result digest
+        result_digest = calculate_result_digest(result)
+
+        ## check this digest with all the results in the result_proof so that client believe the value is correct
+        is_verified = verify(result_digest, result_proof)
+
+        ## [TODO] handle the else case
+        if is_verified:
+            output("[Client",index,":]<< res_operation: ", operation.toString() ," Result: ", result)
+            self.result_sequence.append(result)
+            val = self.command_state[operation.client_seq_id-1]
+            val[1] = 102       ## State 102 -> completed
+            self.wait_for_result = 0
+            self.command_state[operation.client_seq_id-1] = [val[0], val[1]]
+            discard_flag = False
+
+    def receive (msg= ('res_operation_timeout', operation, result_proof, result, replica, replica_index, error)):
+        if error is None:
+            output("Client",index,":<< res_operation_timeout: ", operation.toString() ," Result: ", result, ", Replica: ", replica_index)
+
+            ## calculate the result digest
+            result_digest = calculate_result_digest(result)
+
+            ## check this digest with all the results in the result_proof so that client believe the value is correct
+            is_verified = verify(result_digest, result_proof)
+
+            if is_verified:
+                self.timeout_reply += 1
+                if self.timeout_reply > len(self.config.list_replica)/2:
+                    output("[Client",index,":] Got correct result from Quoram")
+            else:
+                output("[Client",index,":] Invalid Result, start checking for new configuration")
+                start_time = datetime.now()
+                self.config = None
+                self.poll_started = True
+        else:
+            output("[Client",self.index,":] Replica: ", replica_index, " is Immutable, start checking for new configuration")
+            self.error_in_replica += 1
+            start_time = datetime.now()
+            self.config = None
+            self.poll_started = True
+
+    def resultValidation():
+        output("[Client",index,":] Test case completed! Validating Result")
+        client_res_seq = []
+        if len(self.commands) != len(self.result_sequence):
+            output("[Client",index,"] Invalid Final Result!")
+            return
+
+        for i in range(len(self.commands)):
+            command, state = self.command_state[i]
+            operation = makeOperation(i, command)
+            result = performOperation(operation)
+            client_res_seq.append(result)
+
+        for i in range(len(self.commands)):
+            if client_res_seq[i] != self.result_sequence[i]:
+                output("[Client",index,":] Invalid Final Result! Client: ", client_res_seq, ", Replica: ", self.result_sequence)
+                return
+        output("[Client",index,":] Valid Final Result! Client: ", client_res_seq, ", Replica: ", self.result_sequence)
+
+    def performOperation(operation):
+        import re
+        matches = re.findall(r"\'(.+?)\'", operation.command)
+
+        key = None
+        value = None
+
+        if not operation.type is 2 :
+            key = matches[0]
+            value = matches[1]
+        else:
+            key = matches[0]
+
+        if operation.type is 1:     #put
+            self.database[key] = value
+            return 'OK'
+        elif operation.type is 2:   #get
+            if key in self.database:
+                return self.database[key]
+            else:
+                return ''
+        elif operation.type is 3:   #slice
+            limit = value.split(':')
+            if key in self.database and len(self.database[key]) >= int(limit[1]):
+                val = self.database[key]
+                self.database[key] = val[int(limit[0]):int(limit[1])]
+                return 'OK'
+            else:
+                return 'FAIL'
+        elif operation.type is 4:   #append
+            if key in self.database:
+                val = self.database[key]
+                list_val = val+value
+                self.database[key] = list_val
+                return 'OK'
+            else:
+                return 'FAIL'
+
+    def calculate_result_digest(result):
+        HASHER = nacl.hash.sha256
+        result_byte = pickle.dumps(result)
+        result_digest = HASHER(result_byte, encoder=nacl.encoding.HexEncoder)
+        return result_digest
+
+    def verify(result_digest, result_proof):
+        unsigned_result_statement = None
+        i = 0
+        for result_statement in result_proof:
+            try:
+                verify_key = nacl.signing.VerifyKey(replica_public_keys[i], encoder=nacl.encoding.HexEncoder)
+                unsigned_result_statement = pickle.loads(verify_key.verify(result_statement))
+            except:
+                output("[Client",self.index,":] Invalid Result Proof!")
+                ##send(('terminate_shuttle', to = self.replicaList[index])
+
+            #output("[Client",index,":] Checking Cryptohash")
+            i += 1
+            if not unsigned_result_statement is None and unsigned_result_statement.result != result_digest:
+                output("[Client",index,":]Invalid Result, start checking for new configuration")
+                start_time = datetime.now()
+                self.config = None
+                self.poll_started = True
+                return False;
+                break
+        return True

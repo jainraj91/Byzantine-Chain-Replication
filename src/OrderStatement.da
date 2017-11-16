@@ -1,0 +1,4 @@
+class OrderStatement:
+    def __init__(self):
+      self.order = None
+      self.action = None

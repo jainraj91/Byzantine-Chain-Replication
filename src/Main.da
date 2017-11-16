@@ -1,0 +1,640 @@
+import pickle
+import nacl
+import sys
+
+class Olympus(process):
+    def setup(num_replica, head_timeout, nonhead_timeout, failure_list):
+        output("[Olympus:] Setup")
+        class_config = import_da('Configuration')
+        self.config = class_config.Configuration()
+        self.replica_public_keys = []
+        self.replica_failure_map = {}
+        self.state = None
+        self.stateListerners = []
+
+    def run():
+        output("[Olympus:] Started")
+        await(some(received(('terminate_olympus'))))
+
+    def receive(msg = ('req_get_current_configuration', client)):
+        output("[Olympus:]<< req_get_current_configuration")
+        if self.config.config_id is None:
+            makeNewConfiguration()
+
+        output("[Olympus:]>> res_get_current_configuration")
+        send(('res_get_current_configuration', self.config, self.replica_public_keys), to=client)
+
+    def receive(msg = ('req_re_configuration', replica)):
+        output("[Olympus:]<< req_re_configuration")
+        self.state = "RECONFIG"
+        makeNewConfiguration()
+        for listener in self.stateListerners:
+            send(('notify_state_change', self.state), to=listener)
+
+    def receive(msg = ('req_current_state', client, index)):
+        output("[Olympus:]<< req_current_state: Client: ", index)
+        output("[Olympus:]>> res_current_state: ", self.state, " to Client: ", index)
+        send(('res_current_state', self.state), to=client)
+
+    def receive(msg = ('req_register_for_state_change', client)):
+        output("[Olympus:]<< req_register_for_state_change")
+        stateListerners.append(client)
+
+
+    def makeNewConfiguration():
+        output("[Olympus:] Making New Configuration")
+        if self.config.config_id is None:
+            self.config.config_id = 1
+        else:
+            self.config.config_id += 1
+
+        replicaList = []
+        replicaList = new(Replica, num= self.num_replica)
+
+        public_keys = []
+        private_keys = []
+
+        for i in range(self.num_replica):
+            signing_key = nacl.signing.SigningKey.generate()
+            private_keys.append(signing_key)
+            verify_key = signing_key.verify_key
+            verify_key_hex = verify_key.encode(encoder=nacl.encoding.HexEncoder)
+            public_keys.append(verify_key_hex)
+        parse_failures()
+
+        i = 0
+        for replica in replicaList:
+            failure_map = replica_failure_map[str(i)] if str(i) in self.replica_failure_map else {}
+            if i is 0:
+                setup(replica, args=(self, list(replicaList), i, 'head', dict(), dict(), public_keys, private_keys[i], head_timeout, 'PENDING', failure_map))
+            elif i is num_replica-1:
+                setup(replica, args=(self, list(replicaList), i, 'tail', dict(), dict(), public_keys, private_keys[i], nonhead_timeout, 'PENDING', failure_map))
+            else:
+                setup(replica, args=(self, list(replicaList), i, 'normal_replica', dict(), dict(),  public_keys, private_keys[i], nonhead_timeout, 'PENDING', failure_map))
+            i += 1
+
+        self.config.list_replica = list(replicaList)
+        self.replica_public_keys = public_keys
+        start(replicaList)
+        self.state = 'RUNNING'
+
+    def parse_failures():
+        for failure in self.failure_list:
+            import re
+            failure_replica = None
+            failure_type = None
+            source = None
+            client_id = None
+            message_number = None
+
+            matches = re.findall(r"\[(.+?)\]", failure[0])
+            failure_replica = matches[0].split(",")[1]
+
+            failures_injected = failure[1].split(";")
+
+            for failure_type in failures_injected:
+                failure_row = re.findall(r'(?:[^,(]|\([^)]*\))+', failure_type)
+                matches = re.findall(r"\((.+?)\)", failure_row[0])
+                client_id, message_number = matches[0].split(",")
+                source = failure_row[0].split("(")[0]
+                failure_type = failure_row[1]
+
+                try:
+                    self.replica_failure_map[str(failure_replica)][str(failure_type).strip()] = (source.strip(),(client_id, message_number))
+                except KeyError:
+                    self.replica_failure_map[str(failure_replica).strip()] = {str(failure_type).strip(): (source.strip(),(client_id, message_number))}
+
+class Replica(process):
+    def setup(olympus, replicaList, index, type, database, history, public_keys, private_key, timeout, state, fault_map):
+        self.forwarded_request = {}
+        self.current_slot_id = {}
+        self.shuttle_request = {}
+        self.direct_client_request = {}
+        self.result_shuttle_request = {}
+        self.waiting_for_result = {}
+
+    def run():
+        self.state = 'ACTIVE'
+        output("[Replica",self.index,":] Started: ", self.type, self.state)
+        await(some(received(('terminate_replica'))))
+
+    def performOperation(operation):
+        output("[Replica",self.index,":] Perform: ", operation.toString())
+        import re
+        matches = re.findall(r"\'(.+?)\'", operation.command)
+
+        key = None
+        value = None
+
+        if not operation.type is 2 :
+            key = matches[0]
+            value = matches[1]
+        else:
+            key = matches[0]
+
+        if operation.type is 1:
+            self.database[key] = value
+            return 'OK'
+        elif operation.type is 2:
+            if key in self.database:
+                return self.database[key]
+            else:
+                return ''
+        elif operation.type is 3:
+            limit = value.split(':')
+            if key in self.database and len(self.database[key]) >= int(limit[1]):
+                val = self.database[key]
+                self.database[key] = val[int(limit[0]):int(limit[1])]
+                return 'OK'
+            else:
+                return 'FAIL'
+        elif operation.type is 4:
+            if key in self.database:
+                val = self.database[key]
+                list_val = val+value
+                self.database[key] = list_val
+                return 'OK'
+            else:
+                return 'FAIL'
+
+    def receive(msg = ('init_hist', replica_list)):
+        self.state = 'ACTIVE'
+        self.replicaList = replica_list
+
+    def receive(msg = ('req_operation', operation, client, client_index)):
+        ## If the replica is head node, it will create a forward shuttle
+        if self.type == 'head' and state == 'ACTIVE':
+            output("[Replica",self.index,":]<< req_operation: ", operation.toString(), " Client: ", client_index)
+
+            #### assign slot number ######
+            try:
+                self.current_slot_id[client_index] += 1
+            except KeyError:
+                self.current_slot_id[client_index] = 1
+
+            ######### Create action ###########
+            class_action = import_da('Action')
+            action = class_action.Action()
+            action.seq_id = self.current_slot_id[client_index]
+            action.operation = operation
+            order_proof = []
+            result_proof = []
+
+            result = performOperation(action.operation)
+
+            ###### Create order statement #######
+            class_order_statement = import_da('OrderStatement')
+            order_statement = class_order_statement.OrderStatement()
+            order_statement.order = "order"
+            order_statement.action = action
+
+            ##### Sign order statement, add to Order proof #######
+            signed_order_statement = self.private_key.sign(pickle.dumps(order_statement))
+            order_proof.append(signed_order_statement)
+
+            ###### Create result statement ######
+            class_result_statement = import_da('ResultStatement')
+            result_statement = class_result_statement.ResultStatement()
+            result_statement.result_const = "result"
+            result_statement.action = action
+
+            ######## Crypto hash of result #########
+            result_statement.result = calculate_result_digest(result)
+
+            ##### sign result statement, add to result proof #######
+            signed_result_statement = self.private_key.sign(pickle.dumps(result_statement))
+            result_proof.append(signed_result_statement)
+
+            ####### create forward shuttle and send #######
+            class_shuttle = import_da('Shuttle')
+            forward_shuttle = class_shuttle.Shuttle()
+            forward_shuttle.action = action
+            forward_shuttle.order_proof = order_proof
+            forward_shuttle.result_proof = result_proof
+            output("[Replica",self.index,":]>> Shuttle: ", action.operation.toString(), " to Replica: ", index+1)
+            send(('forward_shuttle', self, forward_shuttle, client, client_index), to = self.replicaList[index + 1])
+
+    def receive(msg = ('forward_shuttle', replica, forward_shuttle, client, client_index)):
+        action = forward_shuttle.action
+        output("[Replica",self.index,":]<< Shuttle: ", action.operation.toString(), " from Replica: ", index-1)
+
+        result = None
+        try:
+            self.shuttle_request[client_index] += 1
+        except KeyError:
+            self.shuttle_request[client_index] = 1
+
+        ## fetch result proof and order proof list from shuttle
+        order_proof = forward_shuttle.order_proof
+        result_proof = forward_shuttle.result_proof
+
+        ##### validate orderproof #######
+        is_valid = validate_order_proof(action,order_proof)
+
+        if not is_valid:
+            output("[Replica",self.index,":] Invalid Order Proof, State Immutable, Nofity Wedge to Olympus")
+            self.state = 'IMMUTABLE'
+            send(('wedged', self, self.index, self.database), to = olympus)
+            send(('req_re_configuration', self), to=self.olympus)
+
+        ### normal replica will add its order and result statement
+        ### in shuttle and forward to  next Replica
+        if type == 'normal_replica' and state == 'ACTIVE':
+
+            verify_key = self.private_key.verify_key
+
+            ##### Create order statement #####
+            class_order_statement = import_da('OrderStatement')
+            order_statement = class_order_statement.OrderStatement()
+            order_statement.order = "order"
+
+            #### fault injection scenario
+            if client_index in self.shuttle_request and\
+                self.is_failure_change_operation("shuttle",str(client_index), str(self.shuttle_request[client_index])):
+                output("[Replica",self.index,":] Fault: Change Operation, Client ", client_index, ", Request ",self.shuttle_request[client_index])
+                order_statement = self.change_operation(action, order_statement)
+                result = performOperation(order_statement.action.operation)
+                output("[Replica",self.index,":] Successfully injected fault: Change operation")
+            elif client_index in self.shuttle_request and\
+                self.is_failure_change_result("shuttle", str(client_index), str(self.shuttle_request[client_index])):
+                output("[Replica",self.index,":] Fault: Change Result, Client ", client_index, ", Request: ",self.shuttle_request[client_index])
+                order_statement.action = action
+                result = "OK"
+                output("[Replica",self.index,":] Successfully injected fault: Change result")
+            elif client_index in self.shuttle_request and\
+                self.is_failure_drop_result_stmt("shuttle", str(client_index), str(self.shuttle_request[client_index])):
+                output("[Replica",self.index,":] Fault: Omit Head Result, Client ", client_index, ", Request ",self.shuttle_request[client_index])
+                order_statement.action = action
+                result = performOperation(action.operation)
+                del result_proof[0]
+                output("[Replica",self.index,":] Successfully injected fault: Omit Head Result")
+            else:
+                #output("[Replica",self.index,":] No fault Injected ", client_index, " Corresponding to request ",self.shuttle_request[client_index])
+                order_statement.action = action
+                result = performOperation(action.operation)
+
+            ########### Sign order statement, Add to order proof ###########
+            signed_order_statement = self.private_key.sign(pickle.dumps(order_statement))
+            order_proof.append(signed_order_statement)
+
+            ######## Create result statement ########
+            class_result_statement = import_da('ResultStatement')
+            result_statement = class_result_statement.ResultStatement()
+            result_statement.result_const = "result"
+            result_statement.action = action
+
+            ###### Crypto hash of result #######
+            result_statement.result= calculate_result_digest(result)
+
+            ####### Sign Result Statement, Add to result_proof ###############
+            signed_result_statement = self.private_key.sign(pickle.dumps(result_statement))
+            result_proof.append(signed_result_statement)
+
+            ######## Forward Shuttle #######
+            output("[Replica",self.index,":]>> Shuttle: ", action.operation.toString(), " to Replica: ", index+1)
+            send(('forward_shuttle', self, forward_shuttle, client, client_index), to = self.replicaList[index + 1])
+
+
+        ## If replica is a tail node, it will create a result shuttle
+        if type == 'tail' and state == 'ACTIVE':
+
+            ## Create Order statement
+            class_order_statement = import_da('OrderStatement')
+            order_statement = class_order_statement.OrderStatement()
+            order_statement.order = "order"
+
+            ## failure inject scenario
+            if client_index in self.shuttle_request and\
+                self.is_failure_change_operation("shuttle", str(client_index), str(self.shuttle_request[client_index])):
+                output("[Replica",self.index,":] Fault: Change operation, Client ", client_index, ", Request ",self.shuttle_request[client_index])
+                order_statement = self.change_operation(action, order_statement)
+                result = performOperation(order_statement.action.operation)
+                output("[Replica",self.index,":] Successfully injected fault: Change operation")
+            elif client_index in self.shuttle_request and\
+                self.is_failure_change_result("shuttle", str(client_index), str(self.shuttle_request[client_index])):
+                output("[Replica",self.index,":] Fault: Change result, Client ", client_index, ", Request ",self.shuttle_request[client_index])
+                order_statement.action = action
+                result = "OK"
+                output("[Replica",self.index,":] Successfully injected fault: Change result")
+            elif client_index in self.shuttle_request and\
+                self.is_failure_drop_result_stmt("shuttle", str(client_index), str(self.shuttle_request[client_index])):
+                output("[Replica",self.index,":] Fault: Omit Head Result, Client ", client_index, ", Request ",self.shuttle_request[client_index])
+                order_statement.action = action
+                result = performOperation(action.operation)
+                del result_proof[0]
+                output("[Replica",self.index,":] Successfully injected fault: Omit Head Result")
+            else:
+                #output("[Replica",self.index,":] No fault Injected ", client_index, " Corresponding to request ",self.shuttle_request[client_index])
+                order_statement.action = action
+                result = performOperation(action.operation)
+
+            ##### Sign Order statement, Add to order proof
+            signed_order_statement = self.private_key.sign(pickle.dumps(order_statement))
+            order_proof.append(signed_order_statement)
+
+            ##### Create Result statement ###
+            class_result_statement = import_da('ResultStatement')
+            result_statement = class_result_statement.ResultStatement()
+            result_statement.result_const = "result"
+            result_statement.action = action
+
+            ##### Crypto hash of result ######
+            result_digest = calculate_result_digest(result)
+            result_statement.result = result_digest
+
+            ##### Sign Result statement, Add to Result proof
+            signed_result_statement = self.private_key.sign(pickle.dumps(result_statement))
+            result_proof.append(signed_result_statement)
+
+            ##### Send Result to Client ######
+            send(('res_operation', action.operation, result, result_proof), to=client)
+            output("[Replica",self.index,":]>> res_operation: ", action.operation.toString(), " result: ", result)
+
+
+            ###### Create Result Shuttle #####
+            class_shuttle = import_da('Shuttle')
+            result_shuttle = class_shuttle.Shuttle()
+
+            ###### Add action, result proof to shuttle ####
+            result_shuttle.action = action
+            result_shuttle.result_proof = result_proof
+
+            ###### validate Result proof #######
+            is_valid = validate_result_proof(result_digest, result_shuttle.result_proof)
+
+            ## if not valid, enter into IMMUTABLE state
+            ## else add it into its history and send to previous replica
+            if not is_valid:
+                output("Replica",self.index,":>> Result proof doesnot verify, State changed to Immutable, Nofitying Wedge to Olympus")
+                self.state = 'IMMUTABLE'
+                send(('wedged', self, self.index, self.database), to = olympus)
+                send(('req_re_configuration', self), to=self.olympus)
+            else:
+                self.history[action] = (result_shuttle, result)
+                output("[Replica",self.index,":]>> Result Shuttle: ", action.operation.toString(), " to Replica: ", index-1)
+                send(('result_shuttle', self, result_shuttle, result, client_index), to = self.replicaList[index - 1])
+
+    def receive(msg = ('result_shuttle', replica, result_shuttle, result, client_index)):
+        ##### validating result proof #####
+        temp_result = result
+        result_digest = calculate_result_digest(temp_result)
+        is_valid = validate_result_proof(result_digest, result_shuttle.result_proof)
+
+        ###### If result proof is invalid, become immutable ######
+        if not is_valid:
+            self.state = 'IMMUTABLE'
+            send(('wedged', self, self.index, self.database), to = olympus)
+            send(('req_re_configuration', self), to=self.olympus)
+
+        ##### if result proof is valid, add in history ######
+        if is_valid  and state == 'ACTIVE':
+            action = result_shuttle.action
+            self.history[action] = (result_shuttle, result)
+
+            ##### Kill any running timer ######
+            if action.operation.client_request_id in self.waiting_for_result:
+                wait_operation = self.waiting_for_result[action.operation.client_request_id]
+                if wait_operation[0] == 1 and\
+                    wait_operation[1] == action.operation.client_seq_id:
+                    wait_operation[0] = 0
+                    wait_operation[1] = None
+                    self.waiting_for_result[action.operation.client_request_id] = wait_operation
+
+            output("[Replica",self.index,":]<< Result Shuttle: ", action.operation.toString(), " to Replica: ", index+1)
+            ## fault injection case
+            try:
+                self.result_shuttle_request[client_index] += 1
+            except KeyError:
+                self.result_shuttle_request[client_index] = 1
+
+            ## fault injection scenario
+            if client_index in self.shuttle_request\
+                and self.is_failure_change_result("result_shuttle", str(client_index), str(self.result_shuttle_request[client_index])):
+                output("[Replica",self.index,":] Fault: Change result, Client ", client_index, ", Request ",self.result_shuttle_request[client_index])
+                temp_result = "OK"
+
+                ###### Cryptohash of result ######
+                result_digest = calculate_result_digest(temp_result)
+
+                ## unsign the result statement and overwrite the new result
+                result_statement = result_shuttle.result_proof[self.index]
+                verify_key = nacl.signing.VerifyKey(public_keys[self.index], encoder=nacl.encoding.HexEncoder)
+                unsigned_result_statement = pickle.loads(verify_key.verify(result_statement))
+                unsigned_result_statement.result = result_digest
+
+                ## resign the result_statement and replace it in result_proof
+                signed_result_statement = self.private_key.sign(pickle.dumps(unsigned_result_statement))
+                result_shuttle.result_proof[self.index] = signed_result_statement
+
+                output("[Replica",self.index,":] Successfully injected fault: Change result")
+
+            elif client_index in self.shuttle_request\
+                and self.is_failure_drop_result_stmt("result_shuttle", str(client_index), str(self.result_shuttle_request[client_index])):
+                output("[Replica",self.index,":] Fault: Omit Head Result, Client ", client_index, ", Request ",self.result_shuttle_request[client_index])
+                del result_shuttle.result_proof[0]
+
+                output("[Replica",self.index,":] Successfully injected fault: Omit Head result")
+
+            if not type == 'head' and state == 'ACTIVE':
+                ## send the shuttle to next replica
+                output("[Replica",self.index,":]>> Result Shuttle: ", action.operation.toString(), " to Replica: ", index-1)
+                send(('result_shuttle', self, result_shuttle, result, client_index), to = replicaList[index - 1])
+
+    def receive(msg = ('req_operation_timeout', operation, source, client, client_index)):
+        if self.state == 'ACTIVE':
+            if source == "client":
+                output("[Replica",self.index,":]<< req_operation_timeout: ", operation.toString(), " Client: ", client_index)
+            else:
+                output("[Replica",self.index,":]<< req_operation_timeout: ", operation.toString(), " from Replica[no history], Client: ", client_index)
+            (found_in_history, action) = foundInHistory(operation)
+
+            if found_in_history == True:
+                try:
+                    (result_shuttle, result) = self.history[action]
+                except Exception:
+                    output("[Replica",self.index,":] Not in History: ", operation.toString())
+
+                ##fault injection scenario
+                fault_trigger = "client_request" if source == "client" else "forwarded_request"
+
+                try:
+                    if source == "client":
+                        self.direct_client_request[client_index] += 1
+                    else:
+                        self.forwarded_request[client_index] += 1
+                except KeyError:
+                    if source == "client":
+                        self.direct_client_request[client_index] = 1
+                    else:
+                        self.forwarded_request[client_index] = 1
+
+                message_number = str(self.direct_client_request[client_index]) if source == "client" else str(self.forwarded_request[client_index])
+
+                if client_index in self.shuttle_request and self.is_failure_change_result(fault_trigger, str(client_index), message_number):
+                    output("[Replica",self.index,":] Fault: Change Result,Client ", client_index, ", Request ",message_number)
+                    temp_result = "OK"
+
+                    ##### Crypto Hash of faulty result #####
+                    result_digest = calculate_result_digest(temp_result)
+
+                    ## un-sign the result statement and overwrite the new result
+                    result_statement = result_shuttle.result_proof[self.index]
+                    verify_key = nacl.signing.VerifyKey(self.public_keys[self.index], encoder=nacl.encoding.HexEncoder)
+                    unsigned_result_statement = pickle.loads(verify_key.verify(result_statement))
+                    unsigned_result_statement.result = result_digest
+
+                    ## re-sign the result_statement and replace it in result_proof
+                    signed_result_statement = self.private_key.sign(pickle.dumps(unsigned_result_statement))
+                    result_shuttle.result_proof[self.index] = signed_result_statement
+
+                elif client_index in self.shuttle_request and self.is_failure_drop_result_stmt(fault_trigger, str(client_index), message_number):
+                    output("[Replica",self.index,":] Fault: Omit Head Result, Client ", client_index, ", Request ",self.direct_client_request[client_index])
+                    del result_shuttle.result_proof[0]
+
+                output("[Replica",self.index,":]>> res_operation_timeout: ",operation.toString(), " result: ", result, " to Client")
+                send(('res_operation_timeout', operation, result_shuttle.result_proof, result, self, self.index, None), to=client)
+
+            elif found_in_history == False and not self.type == 'head':
+                output("[Replica",self.index,":]>> res_operation_timeout: ",operation.toString(), " to Head Replica")
+                send(('req_operation_timeout', operation, "replica", client, client_index), to=self.replicaList[0])
+                self.waiting_for_result[operation.client_request_id] = (1, operation.client_seq_id)
+                if await(self.waiting_for_result[operation.client_request_id][0] == 0): pass
+                elif timeout(self.timeout):
+                    output("[Replica",self.index,":] Timeout!! Sending Reconfig Request")
+                    send(('req_re_configuration', self, "replica"), to=olympus)
+                    self.waiting_for_result[operation.client_request_id] = (0, None)
+            elif found_in_history == False and self.type == 'head':
+                if operation.client_seq_id > self.current_slot_id[client_index]:
+                    #treat as new request
+                    send(('req_operation', operation, client, client.index), to=self)
+                else:
+                    self.waiting_for_result[operation.client_request_id] = (1, operation.client_seq_id)
+                    if await(self.waiting_for_result[operation.client_request_id][0]== 0): pass
+                    elif timeout(self.timeout):
+                        output("[Replica",self.index,":] Timeout!! Sending Reconfig Request")
+                        send(('req_re_configuration', self, "replica"), to=olympus)
+                        self.waiting_for_result[operation.client_request_id] = (0, None)
+        elif self.state == 'IMMUTABLE':
+            send(('res_operation_timeout', None, None, None, self, self.index, 'error'), to=client)
+
+    def foundInHistory(operation):
+        for action in self.history.keys():
+            if action.operation.client_request_id == operation.client_request_id and\
+                action.operation.command == operation.command and\
+                action.operation.client_seq_id == operation.client_seq_id and\
+                action.operation.type == operation.type:
+                    return (True, action)
+        return (False, None)
+
+    def is_failure_change_operation(type, client, message):
+        try:
+            (source, (c,m)) = self.fault_map["change_operation()"]
+            if (type, (client, message)) == (source, (c,m)):
+                return True
+        except KeyError:
+            return False
+
+    def is_failure_change_result(type, client, message):
+        try:
+            (source, (c,m)) = fault_map["change_result()"]
+            if (type, (client, message)) == (source, (c,m)):
+                return True
+        except KeyError:
+            return False
+
+    def is_failure_drop_result_stmt(type, client, message):
+        try:
+            (source, (c,m)) = fault_map["drop_result_stmt()"]
+            if (type, (client, message)) == (source, (c,m)):
+                return True
+        except KeyError:
+            return False
+
+    def change_operation(action, order_statement) :
+        output("[Replica",self.index,":] !!!!!! Changing operation from ", action.operation.command , " to get('X') !!!!!!!")
+        class_action = import_da('Action')
+        temp_action = class_action.Action()
+
+        temp_action.seq_id = action.seq_id
+        temp_action.operation = action.operation
+        temp_action.operation.type = 2
+        temp_action.operation.command = "('X')"
+
+        order_statement.action = temp_action
+        return order_statement
+
+    def calculate_result_digest(result):
+        HASHER = nacl.hash.sha256
+        result_byte = pickle.dumps(result)
+        result_digest = HASHER(result_byte, encoder=nacl.encoding.HexEncoder)
+        return result_digest
+
+    def validate_result_proof(result, result_proof):
+        for i in range(len(result_proof)):
+            verify_key = nacl.signing.VerifyKey(public_keys[i], encoder=nacl.encoding.HexEncoder)
+            try:
+                unsigned_result_statement = pickle.loads(verify_key.verify(result_proof[i]))
+                if(unsigned_result_statement.result != result):
+                    return False
+            except Exception:
+                output("[Replica",self.index,":] Invalid Result Proof, Become Immutable, send Wedge to Olympus")
+                send(('req_re_configuration', self), to=self.olympus)
+                self.state = "IMMUTABLE"
+                return False
+        return True
+
+    def validate_order_proof(action, order_proof) :
+        for i in range(len(order_proof)) :
+            verify_key = nacl.signing.VerifyKey(self.public_keys[i], encoder=nacl.encoding.HexEncoder)
+            try:
+                unsigned_order_statement = pickle.loads(verify_key.verify(order_proof[i]))
+                unsigned_operation = unsigned_order_statement.action.operation
+                client_operation = action.operation
+                if not unsigned_operation.isEqual(client_operation):
+                    output("[Replica",self.index,":] Result doesnot match so returning false")
+                    return False
+            except KeyError:
+                output("[Replica",self.index,":] Invalid Order Proof, Become Immutable, send Wedge to Olympus")
+                send(('req_re_configuration', self), to=self.olympus)
+                self.state = "IMMUTABLE"
+                return False
+        return True
+
+def main():
+    test_case = sys.argv[1]
+    ip = None
+    try:
+        ip = sys.argv[2]
+    except Exception:
+        pass
+    config = {}
+    failure_list = []
+    with open(test_case,'r') as f:
+        for line in f:
+            if line[0] != '#':
+                (key,sep,val) = line.partition('=')
+                # if the line does not contain '=', it is invalid and hence ignored
+                if len(sep) != 0:
+                    val = val.strip()
+                    config[key.strip()] = int(val) if str.isdecimal(val) else val
+
+    #class_olympus = import_da('Olympus')
+    class_client = import_da('Client')
+    num_replica = 2 * config['t'] + 1
+
+    for key in config:
+        if "failures" in key:
+            failure_list.append((key,config[key]))
+
+    olympus_node = 'OlympusNode' + '@' + ip if ip is not None else 'OlympusNode'
+    olympus = new(Olympus, args=(num_replica, config['head_timeout'], config['nonhead_timeout'], failure_list), at=olympus_node)
+    clientList = new(class_client.Client, num= config['num_client'])
+    i = 0
+    for client in clientList:
+        load = 'workload[' + str(i) + ']'
+        setup(client, args=(olympus, i, config[str(load)], config['client_timeout']))
+        i += 1
+
+    config(channel = Fifo, clock = Lamport)
+    start(olympus)
+    start(clientList)

@@ -1,0 +1,4 @@
+class CurrentAction:
+  def __init__(self) :
+    self.slot_id = None
+    self.operation = None

@@ -1,0 +1,33 @@
+class Operation:
+    def __init__(self):
+        self.client_seq_id = None
+        self.client_request_id = None
+        self.command = None
+        self.type = None
+        ## put -> 1
+        ## get -> 2
+        ## slice -> 3
+        ## append -> 4
+
+
+    def toString(self):
+        action = ""
+        if self.type == 1:
+            action = "put"
+        elif self.type == 2:
+            action = "get"
+        elif self.type == 3:
+            action = "slice"
+        elif self.type == 4:
+            action = "append"
+        return action+self.command
+
+
+    def isEqual(self, operation):
+        if (self.type == operation.type
+            and self.client_seq_id == operation.client_seq_id
+            and self.client_request_id == operation.client_request_id
+            and self.command == operation.command):
+            return True
+        else:
+            return False
